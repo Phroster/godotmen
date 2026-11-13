@@ -1,0 +1,127 @@
+From b68a017d2a71eac8ea72b47d90d7b013fe77756b Mon Sep 17 00:00:00 2001
+From: Phroster <6192539+Phroster@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 09:01:03 +0200
+Subject: [PATCH] DirAccessWindows keeps its current directory per instance,
+ never SetCurrentDirectoryW.
+
+change_dir() (and so every constructor, through change_dir(".")) switched the
+PROCESS current directory to the target folder to validate and canonicalise it,
+then switched it back. Any other thread that resolved a relative path in that
+window (FileAccessWindows::fix_path, fopen in a loaded DLL, ...) used the wrong
+folder: a relative open failed or opened a file somewhere else.
+
+change_dir() now resolves the folder the way SetCurrentDirectoryW did, without
+touching the process: GetFullPathNameW normalisation, the folder must open with
+traverse access and be a directory, and the trailing separator is dropped
+except after a drive ("C:\"), as GetCurrentDirectoryW returns it. Case and
+junctions are kept as given, res:// / user:// stay bounded, so
+get_current_dir(), "..", drive roots, list_dir_begin, file_exists/dir_exists
+give the same results as before (A/B check of 112 cases on two builds).
+The global lock in change_dir is gone with the shared state it guarded.
+One difference: folders longer than MAX_PATH now open (SetCurrentDirectoryW
+refuses them unless Windows long paths are enabled system-wide).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/windows/dir_access_windows.cpp | 76 +++++++++++++++++---------
+ 1 file changed, 50 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/windows/dir_access_windows.cpp b/drivers/windows/dir_access_windows.cpp
+index 20b1661..c35f956 100644
+--- a/drivers/windows/dir_access_windows.cpp
++++ b/drivers/windows/dir_access_windows.cpp
+@@ -179,41 +179,65 @@ String DirAccessWindows::get_drive(int p_drive) {
+ 	return drives[p_drive].path;
+ }
+ 
+-Error DirAccessWindows::change_dir(String p_dir) {
+-	GLOBAL_LOCK_FUNCTION
++// Resolves an absolute directory path (fix_path output) to the exact string SetCurrentDirectoryW() followed by
++// GetCurrentDirectoryW() would give, without touching the process's current directory (which is process-wide:
++// switching it, even for a moment, broke relative paths opened by any other thread meanwhile).
++// SetCurrentDirectoryW normalises with GetFullPathNameW (".", "..", "/", trailing dots/spaces, also after "\\?\"),
++// opens the directory with traverse access (missing, a file or no access -> failure) and stores it with a trailing
++// separator that GetCurrentDirectoryW drops again unless it follows a drive ("C:\"). The case is kept as given and
++// junctions are not resolved, as before. Unlike SetCurrentDirectoryW there is no MAX_PATH limit (fix_path's "\\?\"
++// paths are long-path ready everywhere else).
++static bool _dir_access_windows_resolve_dir(const String &p_path, String &r_dir) {
++	const Char16String path_utf16 = p_path.utf16();
++	DWORD len = GetFullPathNameW((LPCWSTR)path_utf16.get_data(), 0, nullptr, nullptr);
++	if (len == 0) {
++		return false;
++	}
++	Char16String full;
++	full.resize_uninitialized(len + 1);
++	len = GetFullPathNameW((LPCWSTR)path_utf16.get_data(), full.size(), (LPWSTR)full.ptrw(), nullptr);
++	if (len == 0 || len >= (DWORD)full.size()) {
++		return false;
++	}
+ 
+-	String dir = fix_path(p_dir);
++	HANDLE h = CreateFileW((LPCWSTR)full.get_data(), FILE_TRAVERSE | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
++	if (h == INVALID_HANDLE_VALUE) {
++		return false;
++	}
++	BY_HANDLE_FILE_INFORMATION info;
++	const bool is_dir = GetFileInformationByHandle(h, &info) && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
++	CloseHandle(h);
++	if (!is_dir) {
++		return false;
++	}
+ 
+-	Char16String real_current_dir_name;
+-	size_t str_len = GetCurrentDirectoryW(0, nullptr);
+-	real_current_dir_name.resize_uninitialized(str_len + 1);
+-	GetCurrentDirectoryW(real_current_dir_name.size(), (LPWSTR)real_current_dir_name.ptrw());
+-	String prev_dir = String::utf16((const char16_t *)real_current_dir_name.get_data());
++	String dir = String::utf16((const char16_t *)full.get_data(), len);
++	if (dir.length() > 1 && dir.ends_with("\\") && dir[dir.length() - 2] != ':') {
++		dir = dir.substr(0, dir.length() - 1);
++	}
++	r_dir = dir;
++	return true;
++}
+ 
+-	SetCurrentDirectoryW((LPCWSTR)(current_dir.utf16().get_data()));
+-	bool worked = (SetCurrentDirectoryW((LPCWSTR)(dir.utf16().get_data())) != 0);
++Error DirAccessWindows::change_dir(String p_dir) {
++	// Each instance keeps its own current directory; the process's current directory is never changed (no
++	// SetCurrentDirectoryW, so no global lock is needed either).
++	String dir = fix_path(p_dir);
++
++	String new_dir;
++	if (!_dir_access_windows_resolve_dir(dir, new_dir)) {
++		return ERR_INVALID_PARAMETER;
++	}
+ 
+ 	String base = _get_root_path();
+ 	if (!base.is_empty()) {
+-		str_len = GetCurrentDirectoryW(0, nullptr);
+-		real_current_dir_name.resize_uninitialized(str_len + 1);
+-		GetCurrentDirectoryW(real_current_dir_name.size(), (LPWSTR)real_current_dir_name.ptrw());
+-		String new_dir = String::utf16((const char16_t *)real_current_dir_name.get_data()).trim_prefix(R"(\\?\)").replace_char('\\', '/');
+-		if (!new_dir.begins_with(base)) {
+-			worked = false;
++		if (!new_dir.trim_prefix(R"(\\?\)").replace_char('\\', '/').begins_with(base)) {
++			return ERR_INVALID_PARAMETER;
+ 		}
+ 	}
+ 
+-	if (worked) {
+-		str_len = GetCurrentDirectoryW(0, nullptr);
+-		real_current_dir_name.resize_uninitialized(str_len + 1);
+-		GetCurrentDirectoryW(real_current_dir_name.size(), (LPWSTR)real_current_dir_name.ptrw());
+-		current_dir = String::utf16((const char16_t *)real_current_dir_name.get_data());
+-	}
+-
+-	SetCurrentDirectoryW((LPCWSTR)(prev_dir.utf16().get_data()));
+-
+-	return worked ? OK : ERR_INVALID_PARAMETER;
++	current_dir = new_dir;
++	return OK;
+ }
+ 
+ Error DirAccessWindows::make_dir(String p_dir) {
+-- 
+2.53.0.windows.1
+

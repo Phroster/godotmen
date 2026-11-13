@@ -1,0 +1,103 @@
+From 7281fc6e8943a7a031968d46926e48cbb2d54af0 Mon Sep 17 00:00:00 2001
+From: Phroster <6192539+Phroster@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 06:22:44 +0200
+Subject: [PATCH] Viewport overlay hook for the Ikemen module.
+
+RendererViewport gets a static overlay hook (function pointer, user data,
+viewport RID, first HUD canvas layer). While that viewport is drawn the hook
+runs on the render thread after the 3D pass and before the first canvas layer
+at or above the given layer (after all canvases if there is none, right after
+3D when the viewport draws no 2D). A pending clear request is executed first.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ servers/rendering/renderer_viewport.cpp | 29 +++++++++++++++++++++++++
+ servers/rendering/renderer_viewport.h   | 11 ++++++++++
+ 2 files changed, 40 insertions(+)
+
+diff --git a/servers/rendering/renderer_viewport.cpp b/servers/rendering/renderer_viewport.cpp
+index 8098fea..d84eaf8 100644
+--- a/servers/rendering/renderer_viewport.cpp
++++ b/servers/rendering/renderer_viewport.cpp
+@@ -50,6 +50,11 @@
+ #include "servers/xr/xr_server.h"
+ #endif // XR_DISABLED
+ 
++RendererViewport::OverlayHook RendererViewport::overlay_hook = nullptr;
++void *RendererViewport::overlay_userdata = nullptr;
++RID RendererViewport::overlay_viewport;
++int RendererViewport::overlay_first_layer = 0;
++
+ static Transform2D _canvas_get_transform(RendererViewport::Viewport *p_viewport, RendererCanvasCull::Canvas *p_canvas, RendererViewport::Viewport::CanvasData *p_canvas_data, const Vector2 &p_vp_size) {
+ 	Transform2D xf = p_viewport->global_transform;
+ 
+@@ -407,6 +412,23 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
+ 		_draw_3d(p_viewport);
+ 	}
+ 
++	// Ikemen overlay hook: runs once per draw of `overlay_viewport`, see renderer_viewport.h.
++	bool overlay_pending = overlay_hook != nullptr && p_viewport->self == overlay_viewport;
++	auto run_overlay = [&]() {
++		if (!overlay_pending) {
++			return;
++		}
++		overlay_pending = false;
++		if (RSG::texture_storage->render_target_is_clear_requested(p_viewport->render_target)) {
++			RSG::texture_storage->render_target_do_clear_request(p_viewport->render_target);
++		}
++		overlay_hook(p_viewport->self, p_viewport->render_target, overlay_userdata);
++	};
++
++	if (!can_draw_2d) {
++		run_overlay();
++	}
++
+ 	if (can_draw_2d) {
+ 		RBMap<Viewport::CanvasKey, Viewport::CanvasData *> canvas_map;
+ 
+@@ -684,6 +706,10 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
+ 
+ 		int canvas_idx = 0;
+ 		for (const KeyValue<Viewport::CanvasKey, Viewport::CanvasData *> &E : canvas_map) {
++			if (!scenario_draw_canvas_bg && E.key.get_layer() >= overlay_first_layer) {
++				run_overlay();
++			}
++
+ 			RendererCanvasCull::Canvas *canvas = static_cast<RendererCanvasCull::Canvas *>(E.value->canvas);
+ 
+ 			Transform2D xform = _canvas_get_transform(p_viewport, canvas, E.value, clip_rect.size);
+@@ -745,6 +771,9 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
+ 				_draw_3d(p_viewport);
+ 			}
+ 		}
++
++		// No canvas layer at or above the overlay layer: draw the overlay on top of everything.
++		run_overlay();
+ 	}
+ 
+ 	if (RSG::texture_storage->render_target_is_clear_requested(p_viewport->render_target)) {
+diff --git a/servers/rendering/renderer_viewport.h b/servers/rendering/renderer_viewport.h
+index 2c70de5..b11b5b8 100644
+--- a/servers/rendering/renderer_viewport.h
++++ b/servers/rendering/renderer_viewport.h
+@@ -202,6 +202,17 @@ public:
+ 
+ 	int num_viewports_with_motion_vectors = 0;
+ 
++	// Ikemen overlay hook (used by modules/ikemen). Called on the render thread while `overlay_viewport` is drawn:
++	// after its 3D pass and before its first canvas layer whose layer index is >= `overlay_first_layer`
++	// (or after all of its canvases when there is none, or right after 3D when the viewport draws no 2D).
++	// A pending clear request of the render target is executed first, so the hook always draws onto
++	// the final 3D image. Set these only from the render thread (RS::call_on_render_thread).
++	typedef void (*OverlayHook)(RID p_viewport, RID p_render_target, void *p_userdata);
++	static OverlayHook overlay_hook;
++	static void *overlay_userdata;
++	static RID overlay_viewport;
++	static int overlay_first_layer;
++
+ private:
+ 	Vector<Viewport *> _sort_active_viewports();
+ 	void _viewport_set_size(Viewport *p_viewport, int p_width, int p_height, uint32_t p_view_count);
+-- 
+2.53.0.windows.1
+

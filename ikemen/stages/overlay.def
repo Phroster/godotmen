@@ -1,0 +1,73 @@
+; The host layer's default stage: an empty floor. The host draws the scenery; this stage only gives Ikemen a ground
+; line, wide bounds and neutral depth scaling (the host places the sprite cards in 3D itself). No sprites, no
+; shadows, no music. localcoord 320x240: with the default config, one host unit is one pixel of a 320-wide fighter.
+; x bounds -4000..4000 (op "floor" sets them to the host's own floor), z bounds -1000..1000.
+; Use your own stage .def (config "stage") for other bounds or a different localcoord.
+
+[Info]
+name = "overlay"
+displayname = "Host overlay"
+author = "Ikemen host layer"
+mugenversion = 1.1
+ikemenversion = 1.0
+
+[Camera]
+startx = 0
+starty = 0
+boundleft = -3840
+boundright = 3840
+boundhigh = -400
+boundlow = 0
+tension = 50
+verticalfollow = 0
+floortension = 0
+overdrawhigh = 0
+overdrawlow = 0
+cuthigh = 0
+cutlow = 0
+zoffset = 220
+
+[PlayerInfo]
+p1startx = -70
+p1starty = 0
+p1startz = 0
+p1facing = 1
+p2startx = 70
+p2starty = 0
+p2startz = 0
+p2facing = -1
+leftbound = -4000
+rightbound = 4000
+topbound = -1000
+botbound = 1000
+
+[Scaling]
+topz = 0
+botz = 0
+topscale = 1
+botscale = 1
+depthtoscreen = 0
+
+[Bound]
+screenleft = 0
+screenright = 0
+
+[StageInfo]
+zoffset = 220
+autoturn = 1
+resetbg = 0
+localcoord = 320,240
+
+[Shadow]
+intensity = 0
+reflect = 0
+
+[Reflection]
+intensity = 0
+
+[Music]
+bgmusic =
+
+[BGdef]
+debugbg = 0
+bgclearcolor = 0,0,0

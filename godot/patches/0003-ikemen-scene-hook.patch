@@ -1,0 +1,150 @@
+From 81e54fdab5d57a6e2caa6d851e3f2c96d74ebe68 Mon Sep 17 00:00:00 2001
+From: Phroster <6192539+Phroster@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 02:31:06 +0200
+Subject: [PATCH] Scene hook and late transparent pass in GLES3 for the
+ Ikemen module.
+
+RasterizerSceneGLES3 gets a static scene hook (function pointer, user data,
+render target) called on the render thread while that render target's 3D
+pass is drawn, in two phases:
+
+- opaque: once the opaque pass and the sky are done, before the screen/depth
+  texture copy, with the 3D framebuffer bound (internal size, multisampled
+  under 3D MSAA). It is told whether post-processing encodes that image.
+- transparent: with scene_hook_late_transparent set, the transparent pass is
+  drawn after post-processing instead, on the render target itself at its
+  full size (its depth: the 3D pass's, scaled with the image), and the hook
+  runs right before it with that framebuffer bound.
+
+The module draws Ikemen's frame (its fighters, bodies and effects and
+what lies on the floor) in the transparent phase, leaving the depth of its solid
+sprites, so Godot's fire, smoke, explosions and shadows are blended over
+what lies behind them and hidden by what stands in front of them. The opaque
+phase lets it read the 3D image before post-processing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/gles3/rasterizer_scene_gles3.cpp | 51 ++++++++++++++++++++++--
+ drivers/gles3/rasterizer_scene_gles3.h   | 20 ++++++++++
+ 2 files changed, 67 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gles3/rasterizer_scene_gles3.cpp b/drivers/gles3/rasterizer_scene_gles3.cpp
+index bf41012..58ff990 100644
+--- a/drivers/gles3/rasterizer_scene_gles3.cpp
++++ b/drivers/gles3/rasterizer_scene_gles3.cpp
+@@ -54,6 +54,11 @@
+ 
+ RasterizerSceneGLES3 *RasterizerSceneGLES3::singleton = nullptr;
+ 
++RasterizerSceneGLES3::SceneHook RasterizerSceneGLES3::scene_hook = nullptr;
++void *RasterizerSceneGLES3::scene_hook_userdata = nullptr;
++RID RasterizerSceneGLES3::scene_hook_render_target;
++bool RasterizerSceneGLES3::scene_hook_late_transparent = false;
++
+ RenderGeometryInstance *RasterizerSceneGLES3::geometry_instance_create(RID p_base) {
+ 	RSE::InstanceType type = RSG::utilities->get_base_type(p_base);
+ 	ERR_FAIL_COND_V(!((1 << type) & RSE::INSTANCE_GEOMETRY_MASK), nullptr);
+@@ -2878,6 +2883,14 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
+ 		_draw_sky(render_data.environment, projection, transform, sky_energy_multiplier, render_data.luminance_multiplier, p_camera_data->view_count > 1, flip_y, apply_environment_effects_in_post);
+ 	}
+ 
++	// Ikemen scene hook, opaque phase (and whether the transparent pass is drawn late): see rasterizer_scene_gles3.h.
++	const bool ikemen_hooked = scene_hook != nullptr && !is_reflection_probe && rb->render_target == scene_hook_render_target;
++	const bool ikemen_late = ikemen_hooked && scene_hook_late_transparent;
++	if (ikemen_hooked) {
++		scene_hook(rb->render_target, fbo, rb->internal_size.x, rb->internal_size.y, apply_environment_effects_in_post, SCENE_HOOK_OPAQUE, scene_hook_userdata);
++		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
++	}
++
+ 	if (scene_state.used_screen_texture || scene_state.used_depth_texture) {
+ 		rb->check_backbuffer(scene_state.used_screen_texture, scene_state.used_depth_texture);
+ 		Size2i size = rb->get_internal_size();
+@@ -2909,13 +2922,15 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
+ 		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+ 	}
+ 
+-	RENDER_TIMESTAMP("Render 3D Transparent Pass");
+-	scene_state.enable_gl_blend(true);
+-
+ 	//Render transparent pass
+ 	RenderListParameters render_list_params_alpha(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, spec_constant_base_flags, use_wireframe);
+ 
+-	_render_list_template<PASS_MODE_COLOR_TRANSPARENT>(&render_list_params_alpha, &render_data, 0, render_list[RENDER_LIST_ALPHA].elements.size(), true);
++	if (!ikemen_late) {
++		RENDER_TIMESTAMP("Render 3D Transparent Pass");
++		scene_state.enable_gl_blend(true);
++
++		_render_list_template<PASS_MODE_COLOR_TRANSPARENT>(&render_list_params_alpha, &render_data, 0, render_list[RENDER_LIST_ALPHA].elements.size(), true);
++	}
+ 
+ 	scene_state.enable_gl_stencil_test(false);
+ 
+@@ -2935,6 +2950,34 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
+ 	if (!is_reflection_probe) {
+ 		_render_post_processing(&render_data);
+ 
++		if (ikemen_late) {
++			// Ikemen: the transparent pass on the render target itself, after post-processing scaled the 3D image (and its
++			// depth) into it - the hook's transparent phase first (see rasterizer_scene_gles3.h).
++			GLuint fbo_rt = texture_storage->render_target_get_fbo(rb->render_target);
++			Size2i rt_size = texture_storage->render_target_get_size(rb->render_target);
++			glBindFramebuffer(GL_FRAMEBUFFER, fbo_rt);
++			glViewport(0, 0, rt_size.x, rt_size.y);
++			scene_hook(rb->render_target, fbo_rt, rt_size.x, rt_size.y, apply_environment_effects_in_post, SCENE_HOOK_TRANSPARENT, scene_hook_userdata);
++			glBindFramebuffer(GL_FRAMEBUFFER, fbo_rt);
++			glViewport(0, 0, rt_size.x, rt_size.y);
++
++			RENDER_TIMESTAMP("Render 3D Transparent Pass");
++			scene_state.reset_gl_state();
++			scene_state.enable_gl_depth_test(true);
++			scene_state.enable_gl_blend(true);
++			if (!flip_y) {
++				glFrontFace(GL_CW);
++			}
++
++			_render_list_template<PASS_MODE_COLOR_TRANSPARENT>(&render_list_params_alpha, &render_data, 0, render_list[RENDER_LIST_ALPHA].elements.size(), true);
++
++			if (!flip_y) {
++				glFrontFace(GL_CCW);
++			}
++			scene_state.reset_gl_state();
++			glUseProgram(0);
++		}
++
+ 		texture_storage->render_target_disable_clear_request(rb->render_target);
+ 	}
+ 
+diff --git a/drivers/gles3/rasterizer_scene_gles3.h b/drivers/gles3/rasterizer_scene_gles3.h
+index bfe558d..d24523c 100644
+--- a/drivers/gles3/rasterizer_scene_gles3.h
++++ b/drivers/gles3/rasterizer_scene_gles3.h
+@@ -865,6 +865,26 @@ protected:
+ public:
+ 	static RasterizerSceneGLES3 *get_singleton() { return singleton; }
+ 
++	// Ikemen scene hook (used by modules/ikemen), for the render target `scene_hook_render_target`, called on the render
++	// thread from render_scene() in two phases:
++	// - SCENE_HOOK_OPAQUE: once the opaque pass and the sky are drawn, before the screen/depth texture copy, with the 3D
++	//   framebuffer `p_fbo` (internal size, multisampled under 3D MSAA) bound. `p_post`: tonemapping and the final
++	//   encoding run in post-processing (_render_post_processing) on this image.
++	// - SCENE_HOOK_TRANSPARENT: with `scene_hook_late_transparent` set, the transparent pass is drawn after
++	//   post-processing instead, on the render target itself at its full size (its depth: the 3D pass's, scaled with
++	//   the image), and the hook runs right before it with that framebuffer bound - what it draws there (writing depth
++	//   where it is solid) lies under the transparent objects, and in front of those behind it.
++	// Set these only from the render thread (RS::call_on_render_thread).
++	enum SceneHookPhase {
++		SCENE_HOOK_OPAQUE,
++		SCENE_HOOK_TRANSPARENT,
++	};
++	typedef void (*SceneHook)(RID p_render_target, uint32_t p_fbo, int p_width, int p_height, bool p_post, int p_phase, void *p_userdata);
++	static SceneHook scene_hook;
++	static void *scene_hook_userdata;
++	static RID scene_hook_render_target;
++	static bool scene_hook_late_transparent;
++
+ 	RasterizerCanvasGLES3 *canvas = nullptr;
+ 
+ 	RenderGeometryInstance *geometry_instance_create(RID p_base) override;
+-- 
+2.53.0.windows.1
+

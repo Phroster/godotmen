@@ -1,0 +1,16 @@
+# build outputs
+bin/
+.cache/
+*.dll
+*.exe
+*.obj
+*.o
+__pycache__/
+# never commit game content: character and stage packs stay out of the repository
+/chars/
+/packs/
+ikemen/chars/
+ikemen/sound/
+ikemen/save/
+*.snd
+*.air.bak
